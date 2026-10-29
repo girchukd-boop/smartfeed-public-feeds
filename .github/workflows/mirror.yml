@@ -1,0 +1,142 @@
+name: Update public XML feeds
+on:
+  push:
+    paths: ['.github/workflows/mirror.yml']
+  workflow_dispatch:
+  schedule:
+    - cron: '31 * * * *'
+permissions:
+  contents: write
+concurrency:
+  group: public-xml-delivery
+  cancel-in-progress: false
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download and validate all XML before replacing files
+        run: |
+          python3 - <<'PY'
+          """Mirror already-public XML. No credentials, client databases or source crawling."""
+          import json
+          import os
+          import re
+          import time
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          from decimal import Decimal
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          
+          ROOT = Path(__file__).resolve().parent
+          KINDS = ('search', 'network', 'original', 'merchant')
+          MAX_BYTES = 20 * 1024 * 1024
+          
+          
+          def validate(raw, kind):
+              raw.decode('utf-8', errors='strict')
+              if re.search(br'<!DOCTYPE|<!ENTITY', raw, re.I):
+                  raise ValueError('DTD/entities are forbidden')
+              root = ET.fromstring(raw)
+              if kind == 'merchant':
+                  if root.tag != 'rss' or not root.findall('channel/item'):
+                      raise ValueError('Empty or invalid Merchant XML')
+                  ids = [x.findtext('{http://base.google.com/ns/1.0}id') for x in root.findall('channel/item')]
+                  if not all(ids) or len(set(ids)) != len(ids):
+                      raise ValueError('Missing or duplicate Merchant ID')
+                  return set(ids)
+              if root.tag != 'yml_catalog':
+                  raise ValueError('Expected YML catalog')
+              stamp = datetime.strptime(root.attrib['date'], '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
+              age = (datetime.now(timezone.utc) - stamp).total_seconds()
+              if age > 72 * 3600 or age < -24 * 3600:
+                  raise ValueError('Catalog timestamp is stale or invalid')
+              categories = {x.get('id') for x in root.findall('shop/categories/category')}
+              currencies = {x.get('id') for x in root.findall('shop/currencies/currency')}
+              ids = set()
+              for offer in root.findall('shop/offers/offer'):
+                  oid = offer.get('id')
+                  if not oid or oid in ids:
+                      raise ValueError('Missing or duplicate offer ID')
+                  ids.add(oid)
+                  price = Decimal(offer.findtext('price', '0'))
+                  if not price.is_finite() or price <= 0:
+                      raise ValueError('Invalid price')
+                  if not offer.findtext('name') and not offer.findtext('model'):
+                      raise ValueError('Missing product name')
+                  if offer.findtext('categoryId') not in categories or offer.findtext('currencyId') not in currencies:
+                      raise ValueError('Unknown category/currency')
+                  for field in ('url', 'picture'):
+                      u = urlsplit(offer.findtext(field, ''))
+                      if u.scheme not in ('http', 'https') or not u.hostname or u.username or u.password:
+                          raise ValueError('Invalid product URL/image')
+              if not ids:
+                  raise ValueError('Empty feed')
+              return ids
+          
+          
+          def download(url):
+              for attempt in range(3):
+                  try:
+                      request = urllib.request.Request(url, headers={'User-Agent': 'SmartFeedStudio/3.2', 'Accept': 'application/xml'})
+                      with urllib.request.urlopen(request, timeout=60) as response:
+                          raw = response.read(MAX_BYTES + 1)
+                      if len(raw) > MAX_BYTES:
+                          raise ValueError('XML exceeds size limit')
+                      return raw
+                  except (OSError, TimeoutError):
+                      if attempt == 2:
+                          raise
+                      time.sleep(2 ** attempt)
+          
+          
+          def main():
+              sources = {
+            "radionavi": "https://smartfeed-public-feeds.girchuk.chatgpt.site/feeds/56b3b6dfa363074d6a9325fdf72af0df/4QUfeSG6z8jNQKOFFKpq4jvQWbMexUa8DpvkIHfKOtA/"
+          }
+              pending = {}
+              counts = {}
+              for client, base in sources.items():
+                  if not re.fullmatch('[a-z0-9-]{1,64}', client):
+                      raise ValueError('Invalid client directory')
+                  url = urlsplit(base)
+                  if url.scheme != 'https' or url.hostname != 'smartfeed-public-feeds.girchuk.chatgpt.site' or url.username or url.password or url.query or url.fragment:
+                      raise ValueError('Unexpected public origin')
+                  signatures = []
+                  for kind in KINDS:
+                      raw = download(base + kind + '.xml')
+                      ids = validate(raw, kind)
+                      path = ROOT / 'feeds' / client / (kind + '.xml')
+                      if path.exists():
+                          previous = ET.fromstring(path.read_bytes())
+                          old = {o.get('id') for o in previous.findall('shop/offers/offer')}
+                          if old and len(ids) < len(old) * .85:
+                              raise ValueError('Unexpected product loss; previous feed retained')
+                      signatures.append(ids)
+                      pending[path] = raw
+                  if any(ids != signatures[0] for ids in signatures[1:3]) or len(signatures[3]) != len(signatures[0]):
+                      raise ValueError('Origin changed during download; retry next run')
+                  counts[client] = len(signatures[0])
+              # All clients/formats validated before any tracked file is changed.
+              for path, raw in pending.items():
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  temp = path.with_suffix('.tmp')
+                  temp.write_bytes(raw)
+                  os.replace(temp, path)
+              print(json.dumps({'validated_offers': counts, 'files': len(pending)}))
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY
+      - name: Publish only validated feed files
+        run: |
+          git add -- feeds/
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'SmartFeed delivery'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Refresh validated public product feeds'
+          git push origin HEAD:main
